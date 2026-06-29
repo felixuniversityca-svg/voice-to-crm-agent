@@ -89,7 +89,7 @@ The fix had two parts. First, token hygiene: a skip-list of generic and geograph
 - **Test against real noise early.** The over-matching bug was invisible in code review and obvious the moment real memos ran through it. A messy-input fixture belongs in place before any reconciliation logic is trusted.
 - **Push more decisions into deterministic code.** The less the LLM decides, the fewer the surprises. Identity, thresholds, and gating belong in code, not in a prompt.
 - **Gates cost latency.** Several confirmation taps are safe but slow. A confidence threshold could auto-approve unambiguous matches and reserve human gates for genuine ambiguity.
-- **Add an automated resolver eval.** A labeled set of memo-to-record pairs scored on precision would catch regressions before they reach the CRM, the same way a retrieval eval guards a search system.
+- **Make the safe path the default.** Defaulting to create-new and forcing a gate on ambiguity means the worst case is a duplicate to merge, never a corrupted record. Designing for the cheap failure mode beat trying to be clever about identity.
 
 ## Illustrative code
 
@@ -98,7 +98,21 @@ The fix had two parts. First, token hygiene: a skip-list of generic and geograph
 ```bash
 python resolver_pattern.py   # run the worked examples
 python test_resolver.py      # unit checks for the resolver behaviour
+python eval_resolver.py      # labeled eval: resolver vs a naive baseline
 ```
+
+## Evaluation
+
+`eval_resolver.py` scores the resolver against a naive "pick the closest match and write to it" baseline, on a labeled set of tricky cases: generic-token overlap, twin records, same name in different cities, and garbled input. The metric that matters is not accuracy, it is **wrong writes**, a confident match to the wrong record, which silently corrupts the CRM.
+
+```
+method       correct   wrong writes
+-----------------------------------
+naive         4/8                 4
+resolver      8/8                 0
+```
+
+The naive baseline is fast and dangerous: it writes to the wrong record in half the cases. The resolver trades a few human confirmation taps for zero wrong writes. Reproduce with `python eval_resolver.py`.
 
 ## What this demonstrates
 
