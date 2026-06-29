@@ -1,19 +1,19 @@
 # voice-to-crm-agent
 
-> A sanitized teaching writeup of a production AI agent I built during a private-equity internship. No proprietary code, credentials, or employer or client data appear here, this explains the design and the engineering decisions.
+> A sanitized teaching writeup of a production AI agent I built during a private-equity internship. No proprietary code, credentials, or employer or client data appear here. This explains how the system works and the engineering decisions behind it.
 
-I built an automation that turns a spoken deal update into a structured CRM contact-report, without ever letting the machine write something it merely guessed. The hard problem was never transcription or text generation. It was identity. A post-meeting voice memo is messy, and attaching the right note to the wrong company or person silently corrupts a system of record. The whole design is organized around refusing to guess.
+I built an agent that turns a spoken deal update into structured records in a CRM, and writes them, without ever letting the model commit something it merely guessed. The hard problem was never transcription or text generation. It was identity. A post-meeting voice memo is messy, and attaching the right note to the wrong company or person silently corrupts a system of record. The whole design is organized around one rule: the model may read and propose, but it may not guess who someone is.
 
 ## Architecture: six stages, mirroring how a person processes a memo
 
-The pipeline runs on a workflow orchestrator (n8n) and chains four kinds of external service: a speech-to-text model, an LLM, the CRM read/write API, and a chat channel that supports inline reply buttons (used as the human approval surface).
+The pipeline runs on a workflow orchestrator (n8n) and chains four external services: a speech-to-text model, an LLM, the CRM read/write API, and a chat channel whose inline reply buttons act as the human approval surface.
 
 1. **Capture.** The user sends a voice or text memo to a chat bot. After transcription the two are treated identically.
 2. **Transcribe.** A speech-to-text model returns raw text. No cleanup, no "helpful" reinterpretation.
 3. **Structure.** An LLM converts the transcript into a constrained schema: which entities were mentioned, what happened, what follow-up actions are implied. The LLM proposes, it does not decide identity.
-4. **Reconcile.** Deterministic code searches the CRM for candidate records, scores them, and classifies the situation (clear match, ambiguous, or no match). This is where most of the engineering lives.
-5. **Confirm.** A sequence of inline-button gates asks the human to approve the category, sub-category, the disambiguation of any contested entity, and the specific contact, before anything is written.
-6. **Write.** Only after all gates pass does the workflow create the organization, person, deal, and report records, sequentially, capturing each new record ID to wire up the next.
+4. **Reconcile.** Deterministic code searches the CRM for candidate records, scores them, and classifies the situation as a clear match, ambiguous, or no match. This is where most of the engineering lives.
+5. **Confirm.** A sequence of inline-button gates asks the human to approve the category, the sub-category, the disambiguation of any contested entity, and the specific contact, before anything is written.
+6. **Write.** Once the gates pass, the agent writes to the CRM: it creates the organization, person, deal, and report records in sequence, capturing each new record ID to wire up the next, so the contact-report lands fully linked.
 
 ```mermaid
 flowchart TD
@@ -26,23 +26,22 @@ flowchart TD
     E -->|no match| H[Default: create-new]
     F --> G[Inline-button gates:<br/>category, sub-category, contact]
     H --> G
-    G -->|approved| I{DRY_RUN?}
+    G -->|approved| K[Sequential CRM write,<br/>capture each ID downstream]
     G -->|corrected| C
-    I -->|true| J[Render plan only,<br/>no write]
-    I -->|false| K[Sequential CRM write,<br/>capture IDs downstream]
+    K --> L[Linked contact-report<br/>in the CRM]
 ```
 
 ## Guardrails, and why each exists
 
-- **DRY_RUN flag.** When on, the final stage renders the exact write plan as a message instead of touching the CRM. It let the whole system be demoed and tested against production-like data with zero risk of polluting the system of record. The real write nodes stay dark behind the flag until signed off.
-- **Inline-button approval gates (category, sub-category, disambiguation, contact).** Each is a human checkpoint on an irreversible decision. They exist because an earlier version wrote the report before identity was confirmed, so a wrong company or a misspelling propagated into every downstream record. Gating identity before the write contains the blast radius.
+- **Inline-button approval gates (category, sub-category, disambiguation, contact).** Each is a human checkpoint on an irreversible write. They exist because an earlier version wrote the report before identity was confirmed, so a wrong company or a misspelling propagated into every downstream record. Confirming identity before the write contains the blast radius.
 - **Multi-entity guard.** A single memo can name several organizations, or several people from one institution. The guard counts distinct entities, never raw mentions, so five contacts from one bank resolve to one organization with five people, not five organizations.
-- **"Default to create-new, never guess" resolver rule.** When evidence is weak, the resolver creates a new record rather than attaching to a plausible-looking existing one. A wrong new record is trivially merged later, a wrong attachment silently corrupts an existing one.
-- **Retries, timeouts, dedicated error workflow.** Every external call (transcription, LLM, CRM, chat) gets retries and timeouts, and a global error workflow catches failures instead of leaving a run half-applied.
+- **"Default to create-new, never guess" resolver rule.** When evidence is weak, the resolver creates a new record rather than attaching to a plausible-looking existing one. A wrong new record is trivially merged later. A wrong attachment silently corrupts an existing record.
+- **Reversible, sequential writes.** Records are created in dependency order, each new ID captured before the next call, so a failed run never leaves a half-linked report. Favoring create-new over risky merges keeps every write correctable rather than silently destructive.
+- **Retries, timeouts, and a dedicated error workflow.** Every external call (transcription, LLM, CRM, chat) gets retries and timeouts, and a global error workflow catches failures instead of leaving a run partially applied.
 
 ## Anti-hallucination and reconciliation design
 
-The core principle: the LLM is allowed to read and propose, but identity is decided by deterministic code against the CRM. Reconciliation tokenizes the entity name, drops generic and geographic tokens (legal-form words, "bank", city names) so they cannot create false matches, and scores the remaining distinctive tokens with fuzzy string matching. Transcription noise degrades safely: a garbled name simply fails to match and routes to create-new, rather than snapping to the nearest record. The rule the resolver never breaks: **thematic or geographic proximity is not evidence of identity.** Two family offices in the same city and sector are not the same entity. The resolver forces a human gate only when two or more candidates each have a genuine, conflicting match.
+The core principle: the LLM reads and proposes, but identity is decided by deterministic code against the CRM. Reconciliation tokenizes the entity name, drops generic and geographic tokens (legal-form words, "bank", city names) so they cannot create false matches, and scores the remaining distinctive tokens with fuzzy string matching. Transcription noise degrades safely: a garbled name fails to match and routes to create-new, rather than snapping to the nearest record. The rule the resolver never breaks: **thematic or geographic proximity is not evidence of identity.** Two family offices in the same city and sector are not the same entity. The resolver forces a human gate only when two or more candidates each have a genuine, conflicting match.
 
 ## Failure-mode post-mortem: the over-matching bug
 
@@ -61,7 +60,7 @@ python test_resolver.py      # unit checks for the resolver behaviour
 
 ## What this demonstrates
 
-The interesting part of an LLM agent that touches a system of record is not the model. It is everything built around the model to keep it honest: deterministic identity resolution, human gates on irreversible actions, safe degradation under noise, and testing against real messy input rather than the happy path.
+The interesting part of an LLM agent that writes to a system of record is not the model. It is everything built around the model to keep it honest: deterministic identity resolution, human gates on every irreversible write, safe degradation under noise, and testing against real messy input rather than the happy path.
 
 ## Note on sanitization
 
